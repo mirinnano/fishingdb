@@ -1,128 +1,231 @@
 import requests
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
-from db import insert_weather_data, check_duplicate
+from bs4 import BeautifulSoup
+import json
 
-logging.basicConfig(
-    format='%(asctime)s %(levelname)s:%(message)s',
-    level=logging.INFO
-)
+# db.pyから必要な関数をインポート
+from db import insert_daily_conditions, insert_fishing_results
 
+# --- 初期設定 ---
+logging.basicConfig(format='%(asctime)s %(levelname)s:%(message)s', level=logging.INFO)
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/91.0.4472.124 Safari/537.36'
+    )
 }
 
-def parse_wave_height(text):
-    """波高情報のパース（全角数字＆複数時刻対応）"""
-    match = re.search(r'([0-9２-９]+[．.]?\s*[0-9２-９]*)\s*メートル', text)
-    if match:
-        wave_str = match.group(1).translate(
-            str.maketrans('１２３４５６７８９０．', '1234567890.')
+# --- 気象・潮位データ取得 ---
+def get_marine_and_tide_data():
+    """神奈川県の気象データと潮位データを取得し、統合してDBに保存する"""
+    logging.info("気象・潮位データの取得を開始...")
+    try:
+        # 1. 気象庁から気象データを取得
+        weather_api_url = 'https://www.jma.go.jp/bosai/forecast/data/forecast/140000.json'
+        weather_res = requests.get(weather_api_url, headers=HEADERS, timeout=10)
+        weather_res.raise_for_status()
+        weather_json = weather_res.json()
+
+        # 2. tide736から潮位データを取得
+        today = datetime.now()
+        tide_api_url = (
+            f'https://api.tide736.net/get_tide.php?pc=14&hc=16&rg=week'
+            f'&yr={today.year}&mn={today.month}&dy={today.day}'
         )
-        return float(wave_str)
-    return 0.0
+        tide_res = requests.get(tide_api_url, headers=HEADERS, timeout=10)
+        tide_res.raise_for_status()
 
-def get_tide_data():
-    """潮位データの取得（新規追加）"""
-    today = datetime.now()
-    url = f'https://api.tide736.net/get_tide.php?pc=14&hc=16&rg=week&yr={today.year}&mn={today.month}&dy={today.day}'
-    
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
-        response.raise_for_status()
-        tide_data = response.json()
-        
-        if tide_data.get('status') != 1:
-            raise ValueError(f"APIエラー: {tide_data.get('message', '不明なエラー')}")
-            
-        if 'chart' not in tide_data:
-            raise ValueError("APIレスポンスにchartデータが含まれていません")
+        try:
+            tide_json = tide_res.json()
+        except json.JSONDecodeError:
+            logging.error("Tide APIの応答がJSON形式ではありません。レスポンス内容:")
+            logging.error(tide_res.text)
+            tide_json = {}
 
-        current_date = today.strftime('%Y-%m-%d')
-        chart_data = tide_data['chart'].get(current_date)
-        
-        if not chart_data:
-            available_dates = ', '.join(tide_data['chart'].keys())
-            raise ValueError(f"{current_date}のデータがありません。利用可能な日付: {available_dates}")
-            
-        # 日付情報をobservation_dataに追加（全処理の最初に設定）
-        observation_data['date'] = current_date
-        
-        tide_info = {
-            'high_tide_1_time': chart_data['flood'][0]['time'],
-            'high_tide_1_height': chart_data['flood'][0]['cm'],
-            'high_tide_2_time': chart_data['flood'][1]['time'] if len(chart_data['flood']) > 1 else None,
-            'high_tide_2_height': chart_data['flood'][1]['cm'] if len(chart_data['flood']) > 1 else None,
-            'low_tide_1_time': chart_data['edd'][0]['time'],
-            'low_tide_1_height': chart_data['edd'][0]['cm'],
-            'low_tide_2_time': chart_data['edd'][1]['time'] if len(chart_data['edd']) > 1 else None,
-            'low_tide_2_height': chart_data['edd'][1]['cm'] if len(chart_data['edd']) > 1 else None,
-            'sunrise': chart_data['sun']['rise'],
-            'sunset': chart_data['sun']['set'],
-            'moonrise': re.search(r'\d{1,2}:\d{2}', chart_data['moon']['rise']).group(),
-            'moonset': re.search(r'\d{1,2}:\d{2}', chart_data['moon']['set']).group()
+        # --- データの整形 ---
+        date_for_db = today.strftime('%Y-%m-%d')
+
+        # 気象データの整形
+        weather_data = {
+            'wave_height': 0.0,
+            'precipitation': 0.0,
+            'max_temp': 0.0,
+            'min_temp': 0.0
         }
-        return tide_info
-    except Exception as e:
-        logging.error(f"潮位データの取得に失敗しました: {str(e)}")
-        return None
 
-def get_marine_weather():
-    """海上気象データの取得（潮位データ統合版）"""
-    weather_url = 'https://www.jma.go.jp/bosai/forecast/data/forecast/140000.json' 
-    observation_data = {}
-    
-    try:
-        # 気象データ取得
-        response = requests.get(weather_url, headers=HEADERS, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        forecast_data = data[0]
-        time_series = forecast_data['timeSeries']
-        current_date = datetime.now().strftime('%Y-%m-%d')
-
-        eastern_area = next((area for item in time_series 
-                           for area in item['areas'] 
-                           if area['area']['code'] == '140010'), None)
-
-        if eastern_area:
-            # 既存の気象データ処理
-            temp_series = next((item for item in time_series if 'temps' in item['areas'][0]), None)
-            if temp_series:
-                yokohama = next(area for area in temp_series['areas'] if area['area']['code'] == '46106')
-                observation_data['temperature'] = {
-                    'min': float(yokohama['temps'][2]),
-                    'max': float(yokohama['temps'][1])
-                }
-
-            if 'pops' in eastern_area:
-                valid_pops = [float(p) for p in eastern_area['pops'] if p != '--']
-                observation_data['precipitation'] = max(valid_pops) if valid_pops else 0.0
-
-            if 'waves' in eastern_area:
-                wave_text = eastern_area['waves'][0]
-                observation_data['wave_height'] = parse_wave_height(wave_text)
-
-            # 潮位データ取得（新規追加）
-            tide_data = get_tide_data()
-            if tide_data:
-                observation_data['tide'] = tide_data
-
-        if not check_duplicate(current_date, 'weather_data'):
-            insert_weather_data(observation_data)
-            logging.info(f"{current_date}の気象・潮位データを登録しました")
+        if not weather_json or not isinstance(weather_json, list):
+            logging.warning("気象庁APIから空または不正なデータが返されました。")
         else:
-            logging.warning(f"{current_date}のデータは既に存在します")
-            
-        return observation_data
-        
-    except Exception as e:
-        logging.error(f"データ取得に失敗しました: {str(e)}")
-        return None
+            time_series = weather_json[0].get('timeSeries', [])
 
-if __name__ == "__main__":
-    from db import create_tables
-    create_tables()
-    get_marine_weather()
+            # ── 波浪情報 (waves) は time_series[0] にある
+            if len(time_series) > 0:
+                waves_areas = time_series[0].get('areas', [])
+                eastern = next(
+                    (area for area in waves_areas
+                     if area.get('area', {}).get('code') == '140010'),
+                    {}
+                )
+                waves = eastern.get('waves', [])
+                if waves:
+                    m = re.search(r'(\d+(\.\d+)?)', waves[0])
+                    weather_data['wave_height'] = float(m.group(1)) if m else 0.0
+
+            # ── 降水確率 (pops) は time_series[1] にある
+            if len(time_series) > 1:
+                pops_areas = time_series[1].get('areas', [])
+                eastern = next(
+                    (area for area in pops_areas
+                     if area.get('area', {}).get('code') == '140010'),
+                    {}
+                )
+                pops = eastern.get('pops', [])
+                valid = [float(p) for p in pops if p.isdigit()]
+                weather_data['precipitation'] = max(valid) if valid else 0.0
+
+            # ── 気温情報 (temps) は time_series[2] にある
+            if len(time_series) > 2:
+                temps_areas = time_series[2].get('areas', [])
+                yokohama = next(
+                    (area for area in temps_areas
+                     if area.get('area', {}).get('code') == '46106'),
+                    {}
+                )
+                temps = yokohama.get('temps', [])
+                if len(temps) >= 2:
+                    weather_data['min_temp'] = float(temps[0])
+                    weather_data['max_temp'] = float(temps[1])
+
+        # 潮位データの整形
+        tide_data = {}
+        chart_dict = tide_json.get('tide', {}).get('chart', {})
+        chart_data = chart_dict.get(date_for_db)
+
+        if chart_data:
+            logging.info(f"Tide APIから日付キー '{date_for_db}' のデータを取得しました。")
+
+            tide_data['tide_name'] = chart_data.get('moon', {}).get('title')
+            tide_data['high_tides'] = [
+                {"time": ht.get('time'), "height_cm": ht.get('cm')}
+                for ht in chart_data.get('flood', [])
+            ]
+            tide_data['low_tides'] = [
+                {"time": lt.get('time'), "height_cm": lt.get('cm')}
+                for lt in chart_data.get('edd', [])
+            ]
+            tide_data['sun'] = {
+                "rise": chart_data.get('sun', {}).get('rise'),
+                "set": chart_data.get('sun', {}).get('set')
+            }
+            tide_data['moon'] = {
+                "age": chart_data.get('moon', {}).get('age'),
+                "rise": re.search(
+                    r'\d{1,2}:\d{2}',
+                    chart_data.get('moon', {}).get('rise', '')
+                ).group()
+                if re.search(
+                    r'\d{1,2}:\d{2}',
+                    chart_data.get('moon', {}).get('rise', '')
+                )
+                else None,
+                "set": re.search(
+                    r'\d{1,2}:\d{2}',
+                    chart_data.get('moon', {}).get('set', '')
+                ).group()
+                if re.search(
+                    r'\d{1,2}:\d{2}',
+                    chart_data.get('moon', {}).get('set', '')
+                )
+                else None
+            }
+        else:
+            logging.warning(f"Tide APIから本日の潮位データ({date_for_db})を取得できませんでした。")
+            if chart_dict:
+                logging.debug(f"利用可能な日付キー: {list(chart_dict.keys())}")
+
+        combined_data = {
+            "date": date_for_db,
+            "weather": weather_data,
+            "tide": tide_data
+        }
+        insert_daily_conditions(combined_data)
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"HTTPリクエストエラー: {e}")
+    except Exception as e:
+        logging.error("データ解析中に予期せぬエラーが発生しました。", exc_info=True)
+
+# --- 釣果データ取得 ---
+def get_fishing_data():
+    """釣割から神奈川・千葉・東京の釣果データを取得し、DBに保存する"""
+    logging.info("釣果データの取得を開始...")
+    
+    target_prefs = {
+        "神奈川": "14",
+        "千葉": "12",
+        "東京": "13",
+    }
+    
+    all_results = []
+
+    for pref_name, area_id in target_prefs.items():
+        try:
+            url = f"https://www.chowari.jp/catcharea/?area={area_id}"
+            logging.info(f"[{pref_name}] データを取得中: {url}")
+            response = requests.get(url, headers=HEADERS, timeout=20)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            catch_cards = soup.select('li.catch_item')
+            logging.info(f"[{pref_name}] {len(catch_cards)}件の釣果情報を発見。")
+            
+            for card in catch_cards:
+                shop_name_tag = card.select_one('header h2')
+                shop_name = shop_name_tag.text.strip() if shop_name_tag else "N/A"
+
+                date_tag = card.select_one('.catch_item_date')
+                date_text = date_tag.text.strip() if date_tag else "N/A"
+
+                match = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日', date_text)
+                if not match:
+                    continue
+                
+                year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                report_date = f"{year:04d}-{month:02d}-{day:02d}"
+
+                fish_rows = card.select('.catch_item_fish tr')
+                for row in fish_rows:
+                    fish_name_tag = row.select_one('th')
+                    
+                    if not fish_name_tag:
+                        continue
+
+                    fish_name = re.sub(r'[（\(].*?[）\)]', '', fish_name_tag.text).strip()
+                    if not fish_name:
+                        continue
+                        
+                    details_tags = row.select('td')
+                    details = ' '.join(td.text.strip() for td in details_tags).strip()
+                    
+                    all_results.append({
+                        "report_date": report_date,
+                        "prefecture": pref_name,
+                        "shop_name": shop_name,
+                        "fish_name": fish_name,
+                        "details": details
+                    })
+        
+        except requests.exceptions.RequestException as e:
+            logging.error(f"[{pref_name}] の釣果取得に失敗: {e}")
+            continue
+        except Exception as e:
+            logging.error(f"[{pref_name}] の解析中に予期せぬエラーが発生: {e}", exc_info=True)
+
+    if all_results:
+        insert_fishing_results(all_results)
+    
+    logging.info("釣果データの収集処理が完了しました。")

@@ -1,115 +1,143 @@
+# db.py
 import sqlite3
 import logging
 import json
-from datetime import datetime
 
+# --- データベース接続 ---
 def get_connection():
     return sqlite3.connect('fishing_data.db')
 
+# --- テーブル作成 ---
 def create_tables():
     with get_connection() as conn:
-        # 漁獲結果テーブル
-        conn.execute('''CREATE TABLE IF NOT EXISTS fishing_results (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        date TEXT NOT NULL,
-                        location TEXT NOT NULL,
-                        fish_type TEXT NOT NULL,
-                        quantity INTEGER,
-                        created_at TEXT DEFAULT CURRENT_TIMESTAMP)''')
-        
-        # 気象データテーブル
-        conn.execute('''CREATE TABLE IF NOT EXISTS weather_data (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        date TEXT NOT NULL UNIQUE,
-                        min_temperature REAL,
-                        max_temperature REAL,
-                        precipitation_pct REAL,
-                        wave_height REAL,
-                        created_at TEXT DEFAULT CURRENT_TIMESTAMP)''')
-        
-        # 潮位データテーブル（新規追加）
-        conn.execute('''CREATE TABLE IF NOT EXISTS tide_data (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        date TEXT NOT NULL UNIQUE,
-                        high_tide_1 TIME,
-                        high_tide_1_height REAL,
-                        high_tide_2 TIME,
-                        high_tide_2_height REAL,
-                        low_tide_1 TIME,
-                        low_tide_1_height REAL,
-                        low_tide_2 TIME,
-                        low_tide_2_height REAL,
-                        sunrise TIME,
-                        sunset TIME,
-                        moonrise TIME,
-                        moonset TIME,
-                        created_at TEXT DEFAULT CURRENT_TIMESTAMP)''')
-        
-        logging.info("テーブルが正常に作成されました")
+        logging.info("データベーステーブルを準備中...")
 
-def insert_weather_data(data):
-    # 気象データ挿入処理（潮位データ対応版）
+        # 1. 釣果結果テーブル
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS fishing_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_date TEXT NOT NULL,
+            prefecture TEXT NOT NULL,
+            shop_name TEXT NOT NULL,
+            fish_name TEXT NOT NULL,
+            details TEXT,
+            crawled_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(report_date, shop_name, fish_name)
+        )''')
+
+        # 2. 従来テーブル（JSON格納）
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS daily_conditions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL UNIQUE,
+            min_temp REAL,
+            max_temp REAL,
+            precipitation REAL,
+            wave_height REAL,
+            tide_json TEXT,
+            crawled_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )''')
+
+        # 3. AI 向け平坦化テーブル
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS daily_conditions_flat (
+            date TEXT PRIMARY KEY,
+            min_temp REAL,
+            max_temp REAL,
+            precipitation REAL,
+            wave_height REAL,
+            high_tide_1_time TEXT,
+            high_tide_1_height REAL,
+            high_tide_2_time TEXT,
+            high_tide_2_height REAL,
+            low_tide_1_time TEXT,
+            low_tide_1_height REAL,
+            low_tide_2_time TEXT,
+            low_tide_2_height REAL,
+            sun_rise TEXT,
+            sun_set TEXT,
+            moon_age REAL,
+            moon_rise TEXT,
+            moon_set TEXT
+        )''')
+
+        logging.info("テーブルの準備が完了しました。")
+
+# --- データ挿入 ---
+def insert_daily_conditions(data):
+    """従来の JSON 格納テーブルに挿入"""
     with get_connection() as conn:
-        conn.execute('''INSERT INTO weather_data 
-                        (date, min_temperature, max_temperature, precipitation_pct, wave_height)
-                        VALUES (?, ?, ?, ?, ?)''',
-                    (data['date'], 
-                     data['temperature'].get('min'),
-                     data['temperature'].get('max'),
-                     data.get('precipitation'),
-                     data.get('wave_height')))
-        
-        # 潮位データ挿入（新規追加）
-        if 'tide' in data:
-            conn.execute('''INSERT INTO tide_data (
-                            date, high_tide_1, high_tide_1_height, high_tide_2, high_tide_2_height,
-                            low_tide_1, low_tide_1_height, low_tide_2, low_tide_2_height,
-                            sunrise, sunset, moonrise, moonset)
-                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                        (data['date'],
-                         data['tide'].get('high_tide_1_time'),
-                         data['tide'].get('high_tide_1_height'),
-                         data['tide'].get('high_tide_2_time'),
-                         data['tide'].get('high_tide_2_height'),
-                         data['tide'].get('low_tide_1_time'),
-                         data['tide'].get('low_tide_1_height'),
-                         data['tide'].get('low_tide_2_time'),
-                         data['tide'].get('low_tide_2_height'),
-                         data['tide'].get('sunrise'),
-                         data['tide'].get('sunset'),
-                         data['tide'].get('moonrise'),
-                         data['tide'].get('moonset')))
+        cursor = conn.cursor()
+        tide_json_string = json.dumps(data['tide'], ensure_ascii=False) if data.get('tide') else None
+        w = data['weather']
+        cursor.execute('''
+        INSERT OR IGNORE INTO daily_conditions (
+            date, min_temp, max_temp, precipitation, wave_height, tide_json
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            data['date'],
+            w.get('min_temp'),
+            w.get('max_temp'),
+            w.get('precipitation'),
+            w.get('wave_height'),
+            tide_json_string
+        ))
+        if cursor.rowcount:
+            logging.info(f"[{data['date']}] の気象・潮位データを登録しました。")
+        else:
+            logging.info(f"[{data['date']}] の気象・潮位データは既に登録済みです。")
+
+def insert_daily_conditions_flat(data):
+    """平坦化テーブルに挿入"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        ht = data['tide']['high_tides']
+        lt = data['tide']['low_tides']
+        sun = data['tide']['sun']
+        mn = data['tide']['moon']
+        w = data['weather']
+        cursor.execute('''
+        INSERT OR IGNORE INTO daily_conditions_flat (
+            date, min_temp, max_temp, precipitation, wave_height,
+            high_tide_1_time, high_tide_1_height, high_tide_2_time, high_tide_2_height,
+            low_tide_1_time, low_tide_1_height, low_tide_2_time, low_tide_2_height,
+            sun_rise, sun_set, moon_age, moon_rise, moon_set
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            data['date'], w.get('min_temp'), w.get('max_temp'),
+            w.get('precipitation'), w.get('wave_height'),
+            ht[0]['time'] if len(ht)>0 else None,
+            ht[0]['height_cm'] if len(ht)>0 else None,
+            ht[1]['time'] if len(ht)>1 else None,
+            ht[1]['height_cm'] if len(ht)>1 else None,
+            lt[0]['time'] if len(lt)>0 else None,
+            lt[0]['height_cm'] if len(lt)>0 else None,
+            lt[1]['time'] if len(lt)>1 else None,
+            lt[1]['height_cm'] if len(lt)>1 else None,
+            sun.get('rise'), sun.get('set'),
+            float(mn.get('age')) if mn.get('age') else None,
+            mn.get('rise'), mn.get('set')
+        ))
+        if cursor.rowcount:
+            logging.info(f"[{data['date']}] の平坦化データを登録しました。")
+        else:
+            logging.info(f"[{data['date']}] の平坦化データは既に登録済みです。")
+
+def insert_fishing_results(results_list):
+    """釣果データをDBに挿入"""
+    with get_connection() as conn:
+        inserted = 0
+        for r in results_list:
+            cursor = conn.cursor()
+            cursor.execute('''
+            INSERT OR IGNORE INTO fishing_results
+              (report_date, prefecture, shop_name, fish_name, details)
+            VALUES (?, ?, ?, ?, ?)
+            ''', (
+                r['report_date'], r['prefecture'],
+                r['shop_name'], r['fish_name'], r['details']
+            ))
+            if cursor.rowcount:
+                inserted += 1
         conn.commit()
-
-    # JSON保存処理（潮位データ対応版）
-    json_entry = {
-        "date": data['date'],
-        "weather_metrics": {
-            "min_temperature": data['temperature'].get('min'),
-            "max_temperature": data['temperature'].get('max'),
-            "precipitation_pct": data.get('precipitation'),
-            "wave_height": data.get('wave_height')
-        },
-        "tide_metrics": data.get('tide', {}),
-        "collection_time": datetime.now().isoformat()
-    }
-
-    try:
-        with open('weather_data.json', 'r', encoding='utf-8') as f:
-            existing_data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        existing_data = []
-
-    existing_data.append(json_entry)
-    
-    with open('weather_data.json', 'w', encoding='utf-8') as f:
-        json.dump(existing_data, f, indent=2, ensure_ascii=False)
-
-def check_duplicate(date, table_name):
-    with get_connection() as conn:
-        cursor = conn.execute(f'SELECT COUNT(*) FROM {table_name} WHERE date = ?', (date,))
-        return cursor.fetchone()[0] > 0
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    create_tables()
+        logging.info(f"{inserted} 件の新しい釣果データを保存しました。")
