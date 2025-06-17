@@ -31,8 +31,18 @@ def main():
     schedule.every().monday.at("00:00").do(job)
     schedule.every().wednesday.at("00:00").do(job)
     schedule.every().friday.at("00:00").do(job)
-
-    logging.info("スケジュールを設定しました: 週3回 (月・水・金 00:00)")
+    schedule.every().tuesday.at("00:00").do(job)
+    schedule.every().thursday.at("00:00").do(job)
+    schedule.every().saturday.at("00:00").do(job)
+    schedule.every().sunday.at("00:00").do(job)
+    schedule.every().monday.at("12:00").do(job)
+    schedule.every().wednesday.at("12:00").do(job)
+    schedule.every().friday.at("12:00").do(job)
+    schedule.every().tuesday.at("12:00").do(job)
+    schedule.every().thursday.at("12:00").do(job)
+    schedule.every().saturday.at("12:00").do(job)
+    schedule.every().sunday.at("12:00").do(job)
+    logging.info("スケジュールを設定しました")
 
     try:
         while True:
