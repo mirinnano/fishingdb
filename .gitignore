@@ -18,7 +18,7 @@ ENV/
 .idea/
 
 # SQLite database files
-*.db
+*.joblib
 
 # Local configuration
 .env

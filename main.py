@@ -25,7 +25,7 @@ def main():
     create_tables()
 
     # テスト時に即座に一度ジョブを実行したい場合は次の１行を有効化
-    # job()
+    job()
 
     # スケジュール：月・水・金 00:00
     schedule.every().monday.at("00:00").do(job)
